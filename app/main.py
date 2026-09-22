@@ -16,6 +16,7 @@ from .schemas import (
     BatchPreviewOut,
     BatchTransferIn,
     BatchTransferOut,
+    CapacityIn,
     ContainerIn,
     ContainerOut,
     ContainerStatusOut,
@@ -36,6 +37,10 @@ app = FastAPI(
     description=(
         "登记带体积的初始样品后，批量提交依次发生的容器间转移；"
         "每次按源容器当时的混合比例传播全部祖先来源（Decimal 精确计算）。"
+        "容器可设置容量上限（空值不限制，且不得小于当前体积）；批量提交与预演"
+        "在顺序模拟的每一步检查目标当前体积加转入量，任一目标超上限即整批拒绝"
+        "（返回条目序号、目标与预计超出量），失败时状态、版本、幂等记录与审计链"
+        "均不变化。"
         "支持 /transfers/preview 预演：与真实提交同一套校验与分摊，但不落库。"
         "/transfers/batch 支持可选 idempotency_key：成功请求的指纹与完整响应"
         "随转移同一事务持久化，同键同请求体重放、同键异请求体返回 409。"
@@ -43,17 +48,18 @@ app = FastAPI(
         "结果版本），以前一条记录的哈希形成可校验哈希链；"
         "失败 / 重放 / 预演均不产生审计记录。"
     ),
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
 
 @app.exception_handler(service.LineageError)
 async def lineage_error_handler(request: Request, exc: service.LineageError) -> JSONResponse:
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"error": {"code": exc.code, "message": exc.message}},
-    )
+    error: dict = {"code": exc.code, "message": exc.message}
+    # 结构化附加信息（如容量超限的条目序号 / 目标 / 预计超出量），无则不输出
+    if exc.details is not None:
+        error["details"] = exc.details
+    return JSONResponse(status_code=exc.status_code, content={"error": error})
 
 
 async def raw_request_body(request: Request) -> bytes:
@@ -95,6 +101,20 @@ def create_container(
 ) -> dict:
     service.register_empty_container(conn, body.container_id)
     return {"container_id": body.container_id}
+
+
+@app.put(
+    "/containers/{container_id}/capacity",
+    response_model=ContainerStatusOut,
+    tags=["registry"],
+    summary="设置或修改容器容量上限（null 表示不限制）",
+)
+def set_container_capacity(
+    container_id: str,
+    body: CapacityIn,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    return service.set_container_capacity(conn, container_id, body.capacity)
 
 
 @app.post(
@@ -157,7 +177,7 @@ def preview_transfers(
     "/containers/{container_id}",
     response_model=ContainerStatusOut,
     tags=["query"],
-    summary="查询容器当前体积及来源占比",
+    summary="查询容器当前体积、容量（上限/剩余/利用率）及来源占比",
 )
 def container_status(
     container_id: str, conn: sqlite3.Connection = Depends(get_db)

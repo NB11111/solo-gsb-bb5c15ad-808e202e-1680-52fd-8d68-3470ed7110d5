@@ -43,6 +43,18 @@ class ContainerIn(BaseModel):
         return _check_id(v)
 
 
+class CapacityIn(BaseModel):
+    """设置 / 修改容器容量上限的请求体。"""
+
+    capacity: DecimalStr | None = Field(
+        ...,
+        description=(
+            "容量上限：非负、小数位受 DECIMAL_SCALE 限制，且不得小于容器当前体积；"
+            "null 表示不限制容量。字段必须显式提供（数值或 null）。"
+        ),
+    )
+
+
 class TransferIn(BaseModel):
     source: str = Field(..., min_length=1, description="源容器 ID")
     destination: str = Field(..., min_length=1, description="目标容器 ID")
@@ -119,6 +131,19 @@ class ContainerStatusOut(BaseModel):
         ..., description="容器乐观并发版本：创建时为 0，每次被成功批次触碰后加 1"
     )
     volume: DecimalStr
+    capacity: DecimalStr | None = Field(
+        ..., description="容量上限；null 表示不限制"
+    )
+    remaining: DecimalStr | None = Field(
+        ..., description="剩余可转入空间（容量 - 当前体积）；不限容量时为 null"
+    )
+    utilization: DecimalStr | None = Field(
+        ...,
+        description=(
+            "利用率（当前体积 / 容量），按 PROPORTION_SCALE 四舍五入；"
+            "不限容量或容量为 0 时为 null"
+        ),
+    )
     sources: list[SourceOut]
     proportion_scale: int
 

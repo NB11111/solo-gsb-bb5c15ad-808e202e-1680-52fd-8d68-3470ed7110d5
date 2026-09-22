@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS containers (
     id      TEXT PRIMARY KEY,
     -- 乐观并发版本：创建时为 0，每次成功的批量转移触碰后加 1（同批多次触碰只加 1）
     version INTEGER NOT NULL DEFAULT 0,
+    -- 容量上限：NULL 表示不限制；非 NULL 为 Decimal 字符串，必须 >= 当前体积
+    capacity TEXT,
     created INTEGER NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
@@ -48,7 +50,7 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """对已有数据库做幂等升级（旧库没有 containers.version 列）。
+    """对已有数据库做幂等升级（旧库没有 containers.version / capacity 列）。
 
     ``idempotency_keys`` 与审计链相关的表（``audit_records``、
     ``audit_record_containers``）由建表脚本中的 ``CREATE TABLE IF NOT EXISTS``
@@ -60,6 +62,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE containers ADD COLUMN version INTEGER NOT NULL DEFAULT 0"
         )
+    if columns and "capacity" not in columns:
+        # 旧库中的容器一律不限制容量（NULL）
+        conn.execute("ALTER TABLE containers ADD COLUMN capacity TEXT")
     # 审计表的只追加触发器（BEFORE UPDATE/DELETE -> RAISE），已存在则跳过
     install_audit_triggers(conn)
 
