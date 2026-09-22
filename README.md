@@ -14,6 +14,12 @@
 - 可选的**乐观并发保护**：每个容器持久化一个整数 `version`（创建时为 0），
   `GET /containers/{id}` 返回当前版本；批量提交/预演可携带 `expected_versions`
   做版本校验，成功提交后每个被触碰容器的版本恰好加 1（同批多次出现也只加 1）。
+- **容器容量上限**：`PUT /containers/{id}/capacity` 可为任意容器（含初始样品）
+  设置/修改/取消容量上限（`null` 表示不限制），上限必须**不小于当前体积**。
+  批量提交与预演在**顺序模拟的每一步**检查“目标当前体积 + 转入量”，任一目标
+  超上限即**整批拒绝**，错误中带条目序号、目标容器与预计超出量；同批先转出
+  再转入按当时已释放的余量判断。容器查询返回 `capacity`、`remaining`（剩余空间）
+  与 `utilization`（利用率）。
 - 可选的**幂等键** `idempotency_key`（仅 `/transfers/batch` 生效）：成功请求的
   请求体指纹与完整响应与转移**写入同一 SQLite 事务**；同键同请求体重放首次结果
   （不重复扣减体积、不重复递增 `version`），同键但请求体不同返回
@@ -24,7 +30,8 @@
   摘要**纳入计算，形成可逐条校验的哈希链。审计表由数据库触发器禁止
   UPDATE/DELETE；失败批次、幂等重放与预演**绝不产生记录**。提供按容器、按序号
   范围查询审计记录与一键校验整条链完整性的 API。
-- 可查询任一容器的**当前体积**以及各祖先初始样品的**来源占比**。
+- 可查询任一容器的**当前体积**、**容量信息**（上限 `capacity`、剩余空间 `remaining`、
+  利用率 `utilization`）以及各祖先初始样品的**来源占比**。
 
 ---
 
@@ -57,6 +64,8 @@ SQLite 数据保存在 Docker 命名卷 `lineage-data`（容器内 `/data`）中
 
 - 旧库缺少 `containers.version` 列时自动 `ALTER TABLE ... ADD COLUMN` 补齐，
   已有容器的版本一律视为 `0`；
+- 旧库缺少 `containers.capacity` 列时自动 `ALTER TABLE ... ADD COLUMN capacity TEXT`
+  补齐，已有容器一律回填 `NULL`（**不限制容量**），历史转移与旧客户端行为完全不变；
 - 旧库缺少幂等表时自动创建 `idempotency_keys`
   （`idempotency_key` 主键、`request_sha256` 请求体指纹、`status_code`、
   `response_body` 完整响应、`created`），历史数据不受影响，旧客户端不带键
@@ -86,7 +95,7 @@ print([r[0] for r in c.execute(\"SELECT name FROM sqlite_master WHERE type='tabl
 print([r[1] for r in c.execute('PRAGMA table_info(containers)')])
 "
 # 应包含 idempotency_keys、audit_records、audit_record_containers 表，
-# containers 列中应包含 version；另应存在 4 个 audit_* 触发器
+# containers 列中应包含 version 与 capacity；另应存在 4 个 audit_* 触发器
 ```
 
 停止与清理：
@@ -121,6 +130,10 @@ docker compose down -v       # 同时删除数据卷
 - 每个容器额外持久化一个整数 **`version`**：创建（样品/空容器）时为 `0`，每次成功的
   批量转移后被触碰的容器加 1（同批多次触碰只加 1），用于 `expected_versions` 乐观并发控制。
   服务启动时会自动为旧版本数据库补齐该列，已有容器的版本视为 `0`，无需手工迁移。
+- 每个容器还持久化一个可空的 **`capacity`**（Decimal 字符串）：`NULL` 表示**不限制**；
+  通过 `PUT /containers/{id}/capacity` 设置或修改，上限不得小于容器当前体积（等于当前
+  体积合法，表示“只出不进”；`0` 表示不得装入任何液体）。设置容量不改变体积、不递增
+  `version`、不写审计记录。启动时自动为旧库补齐该列并回填 `NULL`。
 - 表 **`idempotency_keys`** 仅服务于 `/transfers/batch` 的可选幂等：只在批次成功提交时
   写入一行，记录幂等键、原始请求体的 SHA-256 指纹、首次响应的 HTTP 状态码与完整响应体；
   该行与容器扣减、`version` 递增在**同一个 SQLite 事务**内落库。预演接口不写此表，
@@ -158,7 +171,41 @@ curl -X POST http://localhost:8000/containers \
 
 重复登记返回 `409 container_exists`。
 
-### 3. 批量转移（整批原子，按数组顺序依次执行）
+### 3. 设置 / 修改容器容量上限
+
+```bash
+# 为空容器 V1 设置 50 的容量上限
+curl -X PUT http://localhost:8000/containers/V1/capacity \
+  -H 'Content-Type: application/json' \
+  -d '{"capacity":"50"}'
+# 200 -> 返回该容器的完整状态（同 GET）：
+# {"container_id":"V1","version":0,"volume":"0",
+#  "capacity":"50.000000000","remaining":"50.000000000","utilization":"0.000000",
+#  "sources":[],"proportion_scale":6}
+
+# 改为不限制
+curl -X PUT http://localhost:8000/containers/V1/capacity \
+  -H 'Content-Type: application/json' \
+  -d '{"capacity":null}'
+# 200 -> capacity/remaining/utilization 均为 null
+```
+
+规则：
+
+- 请求体 `{"capacity": <体积>}`，体积接受 JSON 数字或字符串（推荐字符串），
+  非负、小数位不超过 `DECIMAL_SCALE`；`{"capacity": null}` 表示**不限制**。
+- 上限必须**不小于容器当前体积**：小于当前体积返回
+  `422 capacity_below_volume`，容量保持原值不变；**等于**当前体积合法
+  （此后只出不进）；`0` 上限只允许用于当前为空的容器（任何转入都会被拒）。
+- 初始样品同样是容器，也可以设置上限。
+- 设置容量**不递增 `version`、不产生审计记录、不改变当前体积**；成功后返回与
+  `GET /containers/{id}` 完全一致的状态对象。
+- 未知容器返回 `404 unknown_container`；负值 / 非有限数 / 小数位超限返回
+  `422 invalid_capacity`。
+
+容量约束如何作用于转移见下一节；错误码见“整批拒绝”表格。
+
+### 4. 批量转移（整批原子，按数组顺序依次执行）
 
 ```bash
 curl -X POST http://localhost:8000/transfers/batch \
@@ -177,6 +224,55 @@ curl -X POST http://localhost:8000/transfers/batch \
 响应中的 `versions` 是本批**每个被触碰容器提交后的版本**：容器创建时 `version=0`，
 每次成功的批量转移后被触碰的容器 `version` 恰好加 1，即使同一容器在本批中多次出现
 （如先作为目标、后作为源的链式转移）也只加 1；未参与本批的容器版本不变。
+
+#### 容量上限约束（capacity）
+
+若目标容器设置了容量上限（见第 3 节），则在顺序模拟的**每一步**转移发生前检查
+“目标**当时**体积 + 本步转入量”是否超过上限：
+
+- 超过即返回 `422 capacity_exceeded`，**整批拒绝、整批回滚**——前序步骤的扣减
+  也不落库，容器状态、`version`、幂等记录与审计链均不变化；
+- 错误体的 `error.details` 给出结构化定位信息：
+  `{"index": <条目序号，从 1 开始>, "destination": "<目标容器>",
+  "overflow": "<预计超出量>"}`，消息中也含“第 N 条转移”；
+- **同批先转出再转入**同一容器时，转出在同一步骤内立即生效，转入按转出后释放的
+  **当时余量**判断，因此“先腾空间再装入”的一批可以整体成功（装入量恰好等于
+  上限也合法，超出 1 个最小刻度都拒绝）；
+- 预演 `/transfers/preview` 使用**完全相同**的逐步判定，状态码、错误码、条目序号、
+  `details` 与真实提交逐字节一致，但不落库；
+- 容量超限的失败请求不写幂等记录，同键可在放宽上限后重试；已成功请求的幂等重放
+  **不重新校验容量**，即使按当前体积重放会超限，也原样返回首次结果。
+
+示例（V1 容量为 10，先转入 8，再尝试一次性转入 3）：
+
+```bash
+curl -X PUT http://localhost:8000/containers/V1/capacity \
+  -H 'Content-Type: application/json' -d '{"capacity":"10"}'
+
+curl -X POST http://localhost:8000/transfers/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"transfers":[{"source":"S1","destination":"V1","volume":"8"}]}'
+# 200
+
+curl -X POST http://localhost:8000/transfers/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"transfers":[{"source":"S1","destination":"V1","volume":"3"}]}'
+# 422 -> {"error":{"code":"capacity_exceeded",
+#   "message":"第 1 条转移超过目标容器 'V1' 容量上限：当前 8.000000000 + 转入 3.000000000 = 11.000000000，上限 10.000000000，预计超出 1.000000000，整批拒绝",
+#   "details":{"index":1,"destination":"V1","overflow":"1.000000000"}}}
+```
+
+同批先转出 2 再转入 3（8 → 6 → 9，未超 10）则整批成功：
+
+```bash
+curl -X POST http://localhost:8000/transfers/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"transfers":[
+    {"source":"V1","destination":"V2","volume":"2"},
+    {"source":"S1","destination":"V1","volume":"3"}
+  ]}'
+# 200 -> V1 最终体积 9.000000000
+```
 
 #### 可选：乐观并发保护（expected_versions）
 
@@ -259,7 +355,10 @@ curl -X POST http://localhost:8000/transfers/batch \
 | 源 / 目标容器不存在 | 404 | `unknown_container` |
 | `source` 与 `destination` 相同 | 422 | `self_transfer` |
 | 转移体积大于源容器当前体积 | 422 | `insufficient_volume` |
+| 目标“当时体积 + 转入量”超过其容量上限（`details` 带 `index` / `destination` / `overflow`） | 422 | `capacity_exceeded` |
 | 体积为 0、为负、非有限数，或小数位超过 `DECIMAL_SCALE` | 422 | `invalid_volume` |
+| 设置容量为负、非有限数，或小数位超过 `DECIMAL_SCALE` | 422 | `invalid_capacity` |
+| 容量上限小于容器当前体积 | 422 | `capacity_below_volume` |
 | `expected_versions` 未恰好覆盖本批全部源/目标（含空对象） | 422 | `invalid_expected_versions` |
 | `expected_versions` 中某容器版本与当前版本不符 | 409 | `stale_container` |
 | 同一 `idempotency_key` 已用于另一个请求体（指纹不同） | 409 | `idempotency_conflict` |
@@ -275,7 +374,7 @@ curl -X POST http://localhost:8000/transfers/batch \
 `422 invalid_seq_range`、`limit` 越界 `422 invalid_limit`；
 `GET /audit/verify` 不返回错误码——链是否完好始终是 200 响应中的 `valid` 字段。
 
-### 4. 预演批量转移（不落库）
+### 5. 预演批量转移（不落库）
 
 `POST /transfers/preview` 使用与批量提交**完全相同的请求结构**（同样接受可选的
 `expected_versions`；`idempotency_key` 字段虽可出现但会被**忽略**——预演不查重、
@@ -285,12 +384,14 @@ curl -X POST http://localhost:8000/transfers/batch \
 - `steps`：每一步的**条目序号**与从各祖先来源**实际扣取的精确份额**（`taken` 之和
   精确等于该步请求体积，同样采用最大余额法）；
 - `containers`：全部受影响容器（本批所有源 / 目标容器）在预演结束时的**最终体积、
-  来源构成与 `version`**，结构与 `GET /containers/{id}` 一致。其中 `version` 是
-  **若按本批真实提交后将变成的版本**（当前版本 + 1，每个被触碰容器只加 1 次）。
+  容量（`capacity` / `remaining` / `utilization`）、来源构成与 `version`**，结构与
+  `GET /containers/{id}` 一致。其中 `version` 是**若按本批真实提交后将变成的版本**
+  （当前版本 + 1，每个被触碰容器只加 1 次）。
 
-预演与真实提交**共用同一套校验、版本校验与分摊代码**：提供 `expected_versions` 时，
+预演与真实提交**共用同一套校验、版本校验、容量校验与分摊代码**：提供 `expected_versions` 时，
 覆盖错误同样返回 `422 invalid_expected_versions`、版本不符同样返回
-`409 stale_container`，HTTP 状态码、`error.code` 以及消息中的条目序号（“第 N 条转移”）
+`409 stale_container`，目标超容量同样返回带 `index` / `destination` / `overflow`
+的 `422 capacity_exceeded`，HTTP 状态码、`error.code` 以及消息中的条目序号（“第 N 条转移”）
 均与 `/transfers/batch` 完全一致。预演**只读不写、不递增版本**，成功或失败都不会改变
 数据库，可以安全地重复调用；因此可用于“先核对预期版本、确认提交后版本，再正式提交”。
 
@@ -319,18 +420,22 @@ curl -X POST http://localhost:8000/transfers/preview \
   ],
   "containers": [
     {"container_id": "S1", "version": 1, "volume": "60.000000000",
+     "capacity": null, "remaining": null, "utilization": null,
      "sources": [{"source_id": "S1", "amount": "60.000000000", "proportion": "1.000000"}],
      "proportion_scale": 6},
     {"container_id": "S2", "version": 1, "volume": "40.000000000",
+     "capacity": null, "remaining": null, "utilization": null,
      "sources": [{"source_id": "S2", "amount": "40.000000000", "proportion": "1.000000"}],
      "proportion_scale": 6},
     {"container_id": "V1", "version": 1, "volume": "75.000000000",
+     "capacity": null, "remaining": null, "utilization": null,
      "sources": [
        {"source_id": "S1", "amount": "30.000000000", "proportion": "0.400000"},
        {"source_id": "S2", "amount": "45.000000000", "proportion": "0.600000"}
      ],
      "proportion_scale": 6},
     {"container_id": "V2", "version": 1, "volume": "25.000000000",
+     "capacity": null, "remaining": null, "utilization": null,
      "sources": [
        {"source_id": "S1", "amount": "10.000000000", "proportion": "0.400000"},
        {"source_id": "S2", "amount": "15.000000000", "proportion": "0.600000"}
@@ -344,7 +449,7 @@ curl -X POST http://localhost:8000/transfers/preview \
 S1 取 10、S2 取 15；调用后数据库中 S1/S2 仍为 100、V1/V2 仍为空，版本也都保持 0；
 各容器返回的 `"version": 1` 是**预测**真实提交后的版本（当前 0 + 1）。
 
-### 5. 查询容器当前体积与来源占比
+### 6. 查询容器当前体积、容量与来源占比
 
 ```bash
 curl http://localhost:8000/containers/V1
@@ -355,6 +460,9 @@ curl http://localhost:8000/containers/V1
   "container_id": "V1",
   "version": 2,
   "volume": "75.000000000",
+  "capacity": "100.000000000",
+  "remaining": "25.000000000",
+  "utilization": "0.750000",
   "sources": [
     {"source_id": "S1", "amount": "30.000000000", "proportion": "0.400000"},
     {"source_id": "S2", "amount": "45.000000000", "proportion": "0.600000"}
@@ -366,6 +474,10 @@ curl http://localhost:8000/containers/V1
 - `version`：容器的乐观并发版本，创建时为 `0`，每次被成功批次触碰后加 1
   （同批多次出现只加 1）；可作为 `/transfers/batch`、`/transfers/preview` 的
   `expected_versions` 入参。
+- `capacity`：容量上限；`null` 表示不限制（新建容器与旧库迁移而来的容器均为 `null`）。
+- `remaining`：剩余空间 `capacity - volume`（恒非负）；`capacity` 为 `null` 时为 `null`。
+- `utilization`：利用率 `volume / capacity`，按 `PROPORTION_SCALE` 四舍五入，仅用于
+  展示；容量为 `null` 时为 `null`；容量与体积均为 `0` 时记为 `1.000000`（已满）。
 - `amount`：该祖先来源在容器中的**绝对体积**（满足体积守恒，可跨容器累加核对）。
 - `proportion`：占容器当前体积的比例，按 `PROPORTION_SCALE` 四舍五入，仅用于展示。
 - 空容器返回 `"version":0`、`"volume":"0"`、`"sources":[]`；未知容器返回 `404 unknown_container`。
@@ -378,10 +490,13 @@ curl http://localhost:8000/containers/V1
 容器扣减、`version` 递增、幂等行所在的**同一个 SQLite 事务**内追加一条审计记录，
 因此审计记录与业务状态要么同时可见、要么一起回滚：
 
-- **失败不留痕**：任何 4xx（参数错误、源液不足、未知容器、自转移、`stale_container`、
-  `idempotency_conflict` 等）整批回滚，审计行一起回滚；
+- **失败不留痕**：任何 4xx（参数错误、源液不足、未知容器、自转移、目标超容量
+  `capacity_exceeded`、`stale_container`、`idempotency_conflict` 等）整批回滚，
+  审计行一起回滚；
 - **预演不留痕**：`/transfers/preview` 只读，成功失败都不写审计；
-- **幂等重放不留痕**：同键同请求体重放直接返回首次响应，不执行转移也不追加审计记录。
+- **幂等重放不留痕**：同键同请求体重放直接返回首次响应，不执行转移也不追加审计记录；
+- **容量设置不留痕**：`PUT /containers/{id}/capacity` 只是容器属性变更，不属于
+  转移批次，不递增 `version` 也不写审计记录（容量约束只体现在其后成功批次的逐步模拟中）。
 
 ### 记录内容
 
@@ -413,7 +528,7 @@ INSERT，不提供修改/删除审计记录的 API。
 > 防写保护；需要更强保证时可定期把 `GET /audit/verify` 与最后一条 `entry_hash`
 > 存放到带外（如离线 WORM / 另一台主机）。
 
-### 6. 查询审计记录：按容器与序号范围
+### 7. 查询审计记录：按容器与序号范围
 
 ```bash
 # 全部记录（按 seq 升序，默认 limit=100，最大 1000）
@@ -478,7 +593,7 @@ curl 'http://localhost:8000/audit/records?start_seq=2&end_seq=10&limit=20'
 }
 ```
 
-### 7. 校验整条审计链
+### 8. 校验整条审计链
 
 ```bash
 curl http://localhost:8000/audit/verify
@@ -560,7 +675,7 @@ pytest -q
 ```
 app/
   config.py     # 环境变量配置
-  db.py         # SQLite 连接、建库（启动时执行，含审计表与只追加触发器迁移）
+  db.py         # SQLite 连接、建库（启动时执行，含 capacity/version 列、审计表与只追加触发器迁移）
   schemas.py    # Pydantic 请求/响应模型（Decimal <-> 字符串）
   service.py    # 核心逻辑：登记、批量转移事务、比例分摊、查询
   audit.py      # 只追加审计链：载荷规范化、哈希、同事务追加、查询、链校验

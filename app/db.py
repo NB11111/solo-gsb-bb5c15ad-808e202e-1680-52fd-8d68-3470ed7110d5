@@ -16,6 +16,8 @@ from .config import settings
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS containers (
     id      TEXT PRIMARY KEY,
+    -- 容量上限（Decimal 字符串）；NULL 表示不限制。转入量使体积超过上限的批次整批拒绝
+    capacity TEXT,
     -- 乐观并发版本：创建时为 0，每次成功的批量转移触碰后加 1（同批多次触碰只加 1）
     version INTEGER NOT NULL DEFAULT 0,
     created INTEGER NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
@@ -48,18 +50,22 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """对已有数据库做幂等升级（旧库没有 containers.version 列）。
+    """对已有数据库做幂等升级（旧库没有 capacity / version 列）。
 
     ``idempotency_keys`` 与审计链相关的表（``audit_records``、
     ``audit_record_containers``）由建表脚本中的 ``CREATE TABLE IF NOT EXISTS``
     负责补齐，旧库升级时自动创建，无需手工迁移；只追加审计触发器在此幂等安装。
     """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(containers)")}
-    if columns and "version" not in columns:
-        # 旧库中的容器版本统一视为 0（DEFAULT 0 会回填到每一行）
-        conn.execute(
-            "ALTER TABLE containers ADD COLUMN version INTEGER NOT NULL DEFAULT 0"
-        )
+    if columns:
+        if "version" not in columns:
+            # 旧库中的容器版本统一视为 0（DEFAULT 0 会回填到每一行）
+            conn.execute(
+                "ALTER TABLE containers ADD COLUMN version INTEGER NOT NULL DEFAULT 0"
+            )
+        if "capacity" not in columns:
+            # 容量上限列：旧库容器一律回填 NULL（不限制），历史转移行为不变
+            conn.execute("ALTER TABLE containers ADD COLUMN capacity TEXT")
     # 审计表的只追加触发器（BEFORE UPDATE/DELETE -> RAISE），已存在则跳过
     install_audit_triggers(conn)
 
@@ -85,7 +91,7 @@ def init_db() -> None:
     try:
         # executescript 自带事务语义；各语句均为 IF NOT EXISTS，幂等
         conn.executescript(_SCHEMA)
-        # 旧版本数据库缺少 version 列时补齐（ALTER TABLE 幂等由本函数判断）
+        # 旧版本数据库缺少 version / capacity 列时补齐（ALTER TABLE 幂等由本函数判断）
         _migrate(conn)
     finally:
         conn.close()

@@ -10,8 +10,12 @@
   ``expected_versions`` 做乐观并发校验：提供时必须恰好覆盖本批全部源/目标，
   任一容器版本与预期不符则在同一写事务内拒绝（409 stale_container），整批不落库。
 * 一批转移严格“依次”发生（后面的转移能看到前面转移的结果）。
-* 任一转移失败（未知容器 / 自转移 / 源液不足 / 参数非法），整批拒绝，
-  数据库状态完全不变（单个事务回滚）。
+* 任一转移失败（未知容器 / 自转移 / 源液不足 / **目标超容量** / 参数非法），
+  整批拒绝，数据库状态完全不变（单个事务回滚）。
+* 每个容器可设置**容量上限** ``capacity``（``None`` 表示不限制）：设置时上限必须
+  不小于容器当前体积；转移模拟在每一步检查“目标当时体积 + 本步转入量”，超限即
+  按条目序号整批拒绝（提交与预演同一套判定，见 :func:`_simulate_transfers`）。
+  同批先转出再转入同一容器时，按当时已释放的余量判断。
 * 预演（preview）与真实提交共享同一份校验与分摊实现（见
   :func:`_simulate_transfers`），错误码与条目序号完全一致；
   预演只读不写（不递增 version），无论成功失败都不改变数据库，但返回中给出
@@ -45,15 +49,29 @@ State = dict[str, Decimal]
 # 容器 ID -> 乐观并发版本
 Versions = dict[str, int]
 
+# 容器 ID -> 容量上限（None 表示不限制）
+Capacities = dict[str, Decimal | None]
+
 
 class LineageError(Exception):
-    """业务错误，映射为 HTTP 4xx。"""
+    """业务错误，映射为 HTTP 4xx。
 
-    def __init__(self, status_code: int, code: str, message: str):
+    ``details`` 为可选的结构化错误字段（随错误响应的 ``error.details`` 一并返回），
+    例如容量超限时给出条目序号、目标容器与预计超出量；无需结构化细节时为 ``None``。
+    """
+
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        details: dict | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
+        self.details = details
 
 
 # --------------------------------------------------------------------------- #
@@ -70,6 +88,27 @@ def parse_volume(raw: Decimal, field: str) -> Decimal:
             422,
             "invalid_volume",
             f"{field} 的小数位不能超过 {settings.decimal_scale} 位",
+        )
+    return raw.quantize(VOLUME_QUANTUM, rounding=ROUND_HALF_EVEN)
+
+
+def parse_capacity(raw: Decimal | None) -> Decimal | None:
+    """校验容量上限：``None`` 表示不限制；否则须非负、有限且小数位受限。
+
+    与体积不同，容量允许为 0（该容器不得装入任何液体），故不复用
+    :func:`parse_volume` 的错误码，统一使用 ``invalid_capacity``。
+    """
+    if raw is None:
+        return None
+    if not raw.is_finite():
+        raise LineageError(422, "invalid_capacity", "capacity 必须是有限数或 null")
+    if raw < 0:
+        raise LineageError(422, "invalid_capacity", "capacity 不能为负")
+    if raw != raw.quantize(VOLUME_QUANTUM, rounding=ROUND_HALF_EVEN):
+        raise LineageError(
+            422,
+            "invalid_capacity",
+            f"capacity 的小数位不能超过 {settings.decimal_scale} 位",
         )
     return raw.quantize(VOLUME_QUANTUM, rounding=ROUND_HALF_EVEN)
 
@@ -109,10 +148,12 @@ def apportion(total: Decimal, shares: Mapping[str, Decimal]) -> dict[str, Decima
 # --------------------------------------------------------------------------- #
 # 状态读写
 # --------------------------------------------------------------------------- #
-def _load_state(conn: sqlite3.Connection, cid: str) -> tuple[State, int] | None:
-    """读取容器状态与当前乐观版本；容器不存在返回 ``None``。"""
+def _load_state(
+    conn: sqlite3.Connection, cid: str
+) -> tuple[State, int, Decimal | None] | None:
+    """读取容器状态、当前乐观版本与容量上限；容器不存在返回 ``None``。"""
     row = conn.execute(
-        "SELECT version FROM containers WHERE id = ?", (cid,)
+        "SELECT version, capacity FROM containers WHERE id = ?", (cid,)
     ).fetchone()
     if row is None:
         return None
@@ -121,7 +162,8 @@ def _load_state(conn: sqlite3.Connection, cid: str) -> tuple[State, int] | None:
         "SELECT source_id, amount FROM components WHERE container_id = ?", (cid,)
     ):
         state[r["source_id"]] = Decimal(r["amount"])
-    return state, int(row["version"])
+    capacity = Decimal(row["capacity"]) if row["capacity"] is not None else None
+    return state, int(row["version"]), capacity
 
 
 def _persist_states(
@@ -190,6 +232,48 @@ def register_empty_container(conn: sqlite3.Connection, cid: str) -> None:
         raise
 
 
+def set_container_capacity(
+    conn: sqlite3.Connection, cid: str, capacity: Decimal | None
+) -> dict:
+    """设置或修改容器容量上限；``capacity`` 为 ``None`` 表示取消限制。
+
+    * 容器不存在 -> 404 ``unknown_container``；
+    * 上限为负 / 非有限 / 小数位超精度 -> 422 ``invalid_capacity``（由
+      :func:`parse_capacity` 在事务开启前拦截）；
+    * 上限小于容器**当前体积** -> 422 ``capacity_below_volume``，整次拒绝、
+      容量不变；等于当前体积合法（此后只出不进）；
+    * 设置容量不触碰 version、不产生转移审计记录。
+
+    成功后返回该容器的完整状态（与 ``GET /containers/{id}`` 同结构）。
+    """
+    capacity = parse_capacity(capacity)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        loaded = _load_state(conn, cid)
+        if loaded is None:
+            raise LineageError(404, "unknown_container", f"容器 '{cid}' 不存在")
+        state, version, _old_capacity = loaded
+        current_volume = sum(state.values(), Decimal(0))
+        if capacity is not None and capacity < current_volume:
+            raise LineageError(
+                422,
+                "capacity_below_volume",
+                (
+                    f"容器 '{cid}' 的容量上限 {capacity} 不能小于当前体积 "
+                    f"{current_volume}，容量未修改"
+                ),
+            )
+        conn.execute(
+            "UPDATE containers SET capacity = ? WHERE id = ?",
+            (None if capacity is None else str(capacity), cid),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return _format_container_status(cid, state, version, capacity)
+
+
 # --------------------------------------------------------------------------- #
 # 批量转移：共享的校验与模拟核心
 # --------------------------------------------------------------------------- #
@@ -255,23 +339,33 @@ def _simulate_transfers(
     prepared: list[tuple[str, str, Decimal]],
     expected_versions: Mapping[str, int] | None = None,
 ) -> tuple[
-    dict[str, State], Versions, list[dict[str, Decimal]], dict[str, State]
+    dict[str, State],
+    Versions,
+    list[dict[str, Decimal]],
+    dict[str, State],
+    Capacities,
 ]:
     """按数组顺序在内存中依次模拟一批转移（链式转移看到本批前序结果）。
 
     只从数据库读取、在内存状态上演算，**不写库**；返回
     ``(被触碰容器的最终状态, 被触碰容器的当前 version, 每一步从各祖先来源
-    实际扣取的份额, 被触碰容器在本批之前的初始状态快照)``。
+    实际扣取的份额, 被触碰容器在本批之前的初始状态快照, 被触碰容器的容量上限)``。
     第四个返回值是各容器**触碰前**的深拷贝快照，供审计记录记载
     version_before / volume_before。提交与预演共用本函数，校验规则、错误码
     与条目序号因此完全一致。
 
     若提供 ``expected_versions``，则在事务内对每个被触碰容器读取到的当前版本做
     乐观并发校验：任一不符即抛 409 stale_container（调用方负责回滚，整批不落库）。
+
+    容量上限在**每一步**转移发生前按目标容器**当时**体积判断：
+    “目标当前体积 + 本步转入量 > capacity”即抛 422 capacity_exceeded，
+    details 携带 ``index`` / ``destination`` / ``overflow``（预计超出量）。
+    同批先转出再转入同一容器时，目标体积已包含前序转出的释放，按当时余量判断。
     """
     touched: dict[str, State] = {}
     pre_states: dict[str, State] = {}
     versions: Versions = {}
+    capacities: Capacities = {}
     taken_steps: list[dict[str, Decimal]] = []
 
     for index, (src, dst, volume) in enumerate(prepared, start=1):
@@ -285,7 +379,7 @@ def _simulate_transfers(
                         "unknown_container",
                         f"第 {index} 条转移中的容器 '{cid}' 不存在，整批拒绝",
                     )
-                state, current_version = loaded
+                state, current_version, capacity = loaded
                 # 乐观并发版本校验在同一写事务内完成（预演时为只读事务，同样不写库）
                 if expected_versions is not None:
                     expected = expected_versions[cid]
@@ -304,10 +398,12 @@ def _simulate_transfers(
                 pre_states[cid] = dict(state)
                 touched[cid] = state
                 versions[cid] = current_version
+                capacities[cid] = capacity
 
         src_state = touched[src]
         dst_state = touched[dst]
         src_total = sum(src_state.values(), Decimal(0))
+        dst_total = sum(dst_state.values(), Decimal(0))
 
         if volume == 0:
             raise LineageError(
@@ -325,6 +421,26 @@ def _simulate_transfers(
                 ),
             )
 
+        # 目标容量上限：按“当时”目标体积 + 本步转入量判断（同批先转出再转入
+        # 时 dst_total 已反映前序转出释放的余量）
+        capacity = capacities[dst]
+        if capacity is not None and dst_total + volume > capacity:
+            overflow = dst_total + volume - capacity
+            raise LineageError(
+                422,
+                "capacity_exceeded",
+                (
+                    f"第 {index} 条转移超过目标容器 '{dst}' 容量上限："
+                    f"当前 {dst_total} + 转入 {volume} = {dst_total + volume}，"
+                    f"上限 {capacity}，预计超出 {overflow}，整批拒绝"
+                ),
+                details={
+                    "index": index,
+                    "destination": dst,
+                    "overflow": str(overflow),
+                },
+            )
+
         # 按源容器“当时”的混合比例取出全部祖先来源
         with localcontext() as ctx:
             ctx.prec = settings.decimal_precision
@@ -337,7 +453,7 @@ def _simulate_transfers(
                 del src_state[sid]
         taken_steps.append(taken)
 
-    return touched, versions, taken_steps, pre_states
+    return touched, versions, taken_steps, pre_states, capacities
 
 
 def build_batch_response(applied: int, versions: Versions) -> dict:
@@ -422,8 +538,8 @@ def _commit_batch(
                     payload=payload,
                 )
 
-        touched, current_versions, taken_steps, pre_states = _simulate_transfers(
-            conn, prepared, expected_versions
+        touched, current_versions, taken_steps, pre_states, _capacities = (
+            _simulate_transfers(conn, prepared, expected_versions)
         )
         next_versions = {cid: ver + 1 for cid, ver in current_versions.items()}
         _persist_states(conn, touched, next_versions)
@@ -537,8 +653,8 @@ def preview_transfers(
 
     conn.execute("BEGIN")
     try:
-        touched, current_versions, taken_steps, _pre_states = _simulate_transfers(
-            conn, prepared, expected_versions
+        touched, current_versions, taken_steps, _pre_states, capacities = (
+            _simulate_transfers(conn, prepared, expected_versions)
         )
         predicted_versions = {cid: ver + 1 for cid, ver in current_versions.items()}
     finally:
@@ -565,7 +681,9 @@ def preview_transfers(
     return {
         "steps": steps,
         "containers": [
-            _format_container_status(cid, touched[cid], predicted_versions[cid])
+            _format_container_status(
+                cid, touched[cid], predicted_versions[cid], capacities[cid]
+            )
             for cid in sorted(touched)
         ],
     }
@@ -574,8 +692,17 @@ def preview_transfers(
 # --------------------------------------------------------------------------- #
 # 查询
 # --------------------------------------------------------------------------- #
-def _format_container_status(cid: str, state: State, version: int) -> dict:
-    """把内存中的容器状态格式化为查询/预演共用的输出结构。"""
+def _format_container_status(
+    cid: str, state: State, version: int, capacity: Decimal | None = None
+) -> dict:
+    """把内存中的容器状态格式化为查询/预演共用的输出结构。
+
+    容量相关字段：``capacity`` 为 ``None`` 时 ``remaining`` / ``utilization``
+    均为 ``None``（不限制）；否则 ``remaining = capacity - volume``（恒非负，
+    因容量设置与转移校验都保证 volume ≤ capacity），``utilization`` 为按
+    ``PROPORTION_SCALE`` 四舍五入的展示值（capacity=0 且 volume=0 时记为 1，
+    表示已满）。
+    """
     total = sum(state.values(), Decimal(0))
     q = Decimal(1).scaleb(-settings.proportion_scale)
     sources: list[dict] = []
@@ -596,19 +723,33 @@ def _format_container_status(cid: str, state: State, version: int) -> dict:
                 }
             )
 
+        if capacity is None:
+            remaining: Decimal | None = None
+            utilization: Decimal | None = None
+        else:
+            remaining = capacity - total
+            if capacity == 0:
+                # 零容量且体积为 0：无剩余空间，利用率视为“已满”
+                utilization = Decimal(1).quantize(q)
+            else:
+                utilization = (total / capacity).quantize(q, rounding=ROUND_HALF_UP)
+
     return {
         "container_id": cid,
         "version": version,
         "volume": str(total),
+        "capacity": None if capacity is None else str(capacity),
+        "remaining": None if remaining is None else str(remaining),
+        "utilization": None if utilization is None else str(utilization),
         "sources": sources,
         "proportion_scale": settings.proportion_scale,
     }
 
 
 def get_container_status(conn: sqlite3.Connection, cid: str) -> dict:
-    """返回容器当前乐观版本、体积与各祖先来源占比。"""
+    """返回容器当前乐观版本、体积、容量信息与各祖先来源占比。"""
     loaded = _load_state(conn, cid)
     if loaded is None:
         raise LineageError(404, "unknown_container", f"容器 '{cid}' 不存在")
-    state, version = loaded
-    return _format_container_status(cid, state, version)
+    state, version, capacity = loaded
+    return _format_container_status(cid, state, version, capacity)
